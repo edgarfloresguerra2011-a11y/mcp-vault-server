@@ -1,0 +1,71 @@
+name: "🚀 Titanium CD: Hardened MCP Vault"
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: "${{ secrets.GCP_PROJECT_ID }}" # Debe configurarse en GitHub Secrets
+  REGION: "us-central1"
+  SERVICE: "mcp-vault-server"
+  IMAGE_NAME: "mcp-vault/gcp-secrets-mcp-server"
+
+jobs:
+  build-and-deploy:
+    name: "🛡️ Hardened Build & Deploy"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: "read"
+      id-token: "write"
+
+    steps:
+      - name: "🛒 Checkout Code"
+        uses: actions/checkout@v4
+
+      - name: "🏗️ Setup Node.js (Hardened Build)"
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: "🛡️ Security Audit & Build"
+        run: |
+          npm ci
+          npm audit --audit-level=high
+          npm run build
+
+      - name: "☁️ Authenticate to Google Cloud"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "${{ secrets.GCP_WID_PROVIDER }}" # Recomendado
+          service_account: "${{ secrets.GCP_SA_EMAIL }}"
+
+      - name: "📦 Docker Build & Push to Artifact Registry"
+        run: |
+          gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+          TAG=$(git rev-parse --short HEAD)
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:$TAG"
+          LATEST="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest"
+
+          docker build --platform linux/amd64 -t "$IMAGE" -t "$LATEST" .
+          docker push "$IMAGE"
+          docker push "$LATEST"
+          echo "IMAGE_TAG=$IMAGE" >> $GITHUB_ENV
+
+      - name: "🚀 Deploy to Cloud Run (Titanium Core)"
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: "${{ env.SERVICE }}"
+          region: "${{ env.REGION }}"
+          image: "${{ env.IMAGE_TAG }}"
+          flags: |
+            --platform=managed
+            --no-allow-unauthenticated
+            --service-account=mcp-vault-sa@${{ env.PROJECT_ID }}.iam.gserviceaccount.com
+            --set-env-vars=GCP_PROJECT_ID=${{ env.PROJECT_ID }},NODE_ENV=production,TRANSPORT=http
+            --set-secrets=MCP_AUTH_TOKENS=mcp-auth-tokens:latest
+            --update-env-vars=PUBSUB_ROTATION_TOPIC=secret-rotation-events
+            --memory=512Mi
+            --cpu=1
+            --timeout=60
